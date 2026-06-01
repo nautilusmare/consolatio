@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+
+    <!-- Primary -->
+    <title>Consolatio</title>
+    <meta name="description" content="A Reformed pastoral companion for the care of souls." />
+
+    <!-- PWA -->
+    <link rel="manifest" href="/manifest.json" />
+    <meta name="theme-color" content="#0d0a07" />
+
+    <!-- iOS PWA — critical for home screen install -->
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Consolatio" />
+    <link rel="apple-touch-icon" href="/icons/icon-180.png" />
+
+    <!-- iOS splash screens (optional but polished) -->
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+
+    <!-- Prevent tap highlight on iOS -->
+    <style>
+      * { -webkit-tap-highlight-color: transparent; }
+      html, body { height: 100%; margin: 0; padding: 0; background: #0d0a07; }
+      /* Safe area support for iPhone notch / Dynamic Island */
+      #root {
+        height: 100%;
+        padding-top: env(safe-area-inset-top);
+        padding-bottom: env(safe-area-inset-bottom);
+        box-sizing: border-box;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

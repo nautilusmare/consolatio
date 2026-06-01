@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Background -->
+  <rect width="512" height="512" rx="112" fill="#0d0a07"/>
+
+  <!-- Outer ring — faint amber -->
+  <circle cx="256" cy="256" r="200" fill="none" stroke="#3a2c1a" stroke-width="1.5"/>
+
+  <!-- Cross — vertical beam -->
+  <rect x="244" y="96" width="24" height="320" rx="4" fill="#c9923a" opacity="0.9"/>
+
+  <!-- Cross — horizontal beam (positioned at golden ratio ~38% from top) -->
+  <rect x="136" y="190" width="240" height="24" rx="4" fill="#c9923a" opacity="0.9"/>
+
+  <!-- Subtle glow behind cross center -->
+  <circle cx="256" cy="202" r="28" fill="#c9923a" opacity="0.07"/>
+
+  <!-- Inner ring — very faint -->
+  <circle cx="256" cy="256" r="156" fill="none" stroke="#2a1e10" stroke-width="1"/>
+</svg>
