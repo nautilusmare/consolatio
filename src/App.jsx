@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const DEFAULT_MODEL = "anthropic/claude-sonnet-4-5";
@@ -134,13 +134,41 @@ const LS = {
   raw:(k,fb)=>{ try{ return localStorage.getItem(k)||fb; }catch{ return fb; }},
   setRaw:(k,v)=>{ try{ localStorage.setItem(k,v); }catch{} },
 };
-const fmt     = d => new Intl.DateTimeFormat("en",{hour:"numeric",minute:"2-digit",hour12:true}).format(new Date(d));
-const fmtDate = d => new Intl.DateTimeFormat("en",{month:"short",day:"numeric"}).format(new Date(d));
+// Undefined locale = the visitor's own, so a German reader sees German timestamps.
+const fmt     = d => new Intl.DateTimeFormat(undefined,{hour:"numeric",minute:"2-digit",hour12:undefined}).format(new Date(d));
+const fmtDate = d => new Intl.DateTimeFormat(undefined,{month:"short",day:"numeric"}).format(new Date(d));
+
+const APP_VERSION = typeof __APP_VERSION__!=="undefined" ? __APP_VERSION__ : "0.0.0";
+
+// Escape closes the topmost overlay, matching the tap-outside-to-dismiss behaviour.
+function useEscape(active,onClose){
+  useEffect(()=>{
+    if(!active) return;
+    const onKeyDown=e=>{ if(e.key==="Escape"){ e.stopPropagation(); onClose(); } };
+    window.addEventListener("keydown",onKeyDown);
+    return()=>window.removeEventListener("keydown",onKeyDown);
+  },[active,onClose]);
+}
 
 function groupByProvider(models){
   const m={};
   for(const x of models){ if(!m[x.provider]) m[x.provider]=[]; m[x.provider].push(x); }
   return Object.entries(m).sort(([a],[b])=>a.localeCompare(b));
+}
+
+// Turn an OpenRouter failure into something a person can act on, instead of
+// rendering the raw JSON error body into the conversation as if it were a reply.
+function openRouterError(status,data){
+  const apiMsg=data?.error?.message||data?.message;
+  if(status===401) return "Your OpenRouter API key was rejected. Check it in Settings \u2192 API Keys.";
+  if(status===402) return "Your OpenRouter account has no credit left. Add credit, then try again.";
+  if(status===429) return "OpenRouter is rate-limiting this key. Wait a moment, then try again.";
+  if(status===404) return "That model is no longer available on OpenRouter. Choose another in the model selector.";
+  if(status>=500)  return `OpenRouter is having trouble right now (${status}). Please try again in a moment.`;
+  if(status===413)  return "This conversation is too long for the current model. Try \u26a1 Compress, or switch to a model with a larger context.";
+  return apiMsg
+    ? `The request failed (${status}): ${apiMsg}`
+    : `The request failed (${status}). Please try again.`;
 }
 
 function buildSystemPrompt(profile){
@@ -174,11 +202,19 @@ async function fetchESVPassage(ref,apiKey){
   try{
     const url=`https://api.esv.org/v3/passage/text/?q=${encodeURIComponent(ref)}&include-headings=false&include-footnotes=false&include-verse-numbers=true&include-short-copyright=false&include-passage-references=false`;
     const res=await fetch(url,{headers:{Authorization:`Token ${apiKey}`}});
-    const data=await res.json();
-    const text=(data.passages||[])[0];
+    const data=await res.json().catch(()=>null);
+    if(!res.ok) return{reference:ref,text:"",error:esvError(res.status)};
+    const text=(data?.passages||[])[0];
     if(!text||text.trim()==="") return null;
     return{reference:data.canonical||ref,text:text.trim()};
-  }catch{ return null; }
+  }catch{ return{reference:ref,text:"",error:"Could not be fetched. Check your connection."}; }
+}
+
+function esvError(status){
+  if(status===401||status===403) return "ESV key rejected. Check it in Settings \u2192 API Keys.";
+  if(status===429) return "ESV is rate-limiting this key. Try again shortly.";
+  if(status===404) return "ESV has no passage for that reference.";
+  return `ESV could not return that passage (${status}).`;
 }
 
 // ── Tavily utilities ──────────────────────────────────────────────────────────
@@ -221,11 +257,6 @@ const Ico = ({d,size=16,sw=1.6})=>(
     {[].concat(d).map((p,i)=><path key={i} d={p}/>)}
   </svg>
 );
-const LineIco = ({lines,size=16,sw=1.6})=>(
-  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={sw} strokeLinecap="round">
-    {lines.map((l,i)=><line key={i} {...l}/>)}
-  </svg>
-);
 const StarIcon=({filled,color})=>(
   <svg width="14" height="14" viewBox="0 0 24 24" fill={filled?color:"none"} stroke={filled?color:"#9a8a74"} strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
     <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
@@ -264,7 +295,12 @@ const TypingIndicator=({t})=>(
 // ── Message ───────────────────────────────────────────────────────────────────
 const Message=({msg,t,esvKey})=>{
   const isUser=msg.role==="user";
-  const refs=(!isUser&&esvKey)?extractScriptureRefs(msg.content):[];
+  // Memoised: extractScriptureRefs returns a fresh array, and ESVCards keys its
+  // fetch effect on this value, so a new array each render re-triggered it.
+  const refs=useMemo(
+    ()=>(!isUser&&esvKey)?extractScriptureRefs(msg.content):[],
+    [msg.content,isUser,esvKey]
+  );
   return(
     <div style={{display:"flex",flexDirection:"column",alignItems:isUser?"flex-end":"flex-start",marginBottom:22,animation:"fadeUp 0.28s ease forwards"}}>
       {!isUser&&<div style={{fontSize:10,letterSpacing:"0.14em",color:t.accent,marginBottom:6,textTransform:"uppercase",fontFamily:"'IM Fell English',Georgia,serif",fontStyle:"italic"}}>Consolatio</div>}
@@ -280,7 +316,7 @@ const Message=({msg,t,esvKey})=>{
 // ── ScriptureCard ─────────────────────────────────────────────────────────────
 const ScriptureCard=({reference,text,t,onClose})=>(
   <div style={{padding:"13px 17px",borderLeft:`2px solid ${t.scriptureBorder}`,background:t.scriptureBar,borderRadius:"0 10px 10px 0",position:"relative"}}>
-    {onClose&&<button onClick={onClose} style={{position:"absolute",top:8,right:10,background:"none",border:"none",color:t.textMuted,cursor:"pointer",fontSize:16,lineHeight:1}}>×</button>}
+    {onClose&&<button onClick={onClose} aria-label="Dismiss passage" style={{position:"absolute",top:8,right:10,background:"none",border:"none",color:t.textMuted,cursor:"pointer",fontSize:16,lineHeight:1}}>×</button>}
     <div style={{fontSize:10,letterSpacing:"0.16em",color:t.scriptureRef,textTransform:"uppercase",marginBottom:7,fontFamily:"Lato,sans-serif"}}>{reference} — ESV</div>
     <div style={{fontSize:14,lineHeight:1.78,color:t.scriptureText,fontFamily:"'IM Fell English',Georgia,serif",fontStyle:"italic"}}>{text}</div>
   </div>
@@ -315,13 +351,19 @@ function ESVCards({refs,esvKey,t}){
               Fetching {ref}…
             </div>
           )}
-          {passages[ref]&&(
+          {passages[ref]&&!passages[ref].error&&(
             <ScriptureCard
               reference={passages[ref].reference}
               text={passages[ref].text}
               t={t}
               onClose={()=>setDismissed(d=>({...d,[ref]:true}))}
             />
+          )}
+          {passages[ref]&&passages[ref].error&&(
+            <div style={{padding:"7px 14px",borderLeft:`2px solid ${t.danger}`,background:t.dangerBg,borderRadius:"0 8px 8px 0",fontSize:11,color:t.danger,fontFamily:"Lato,sans-serif",display:"flex",justifyContent:"space-between",gap:10,alignItems:"center"}}>
+              <span>{ref} — {passages[ref].error}</span>
+              <button onClick={()=>setDismissed(d=>({...d,[ref]:true}))} aria-label="Dismiss" style={{background:"none",border:"none",color:"inherit",cursor:"pointer",fontSize:14,lineHeight:1,flexShrink:0}}>×</button>
+            </div>
           )}
         </div>
       ))}
@@ -338,7 +380,7 @@ function ResourceCard({results,loading,t,onClose}){
         <div style={{fontSize:10,color:t.accent,letterSpacing:"0.16em",textTransform:"uppercase",fontFamily:"Lato,sans-serif"}}>
           Reformed Resources
         </div>
-        <button onClick={onClose} style={{background:"none",border:"none",color:t.textMuted,cursor:"pointer",fontSize:16,lineHeight:1}}>×</button>
+        <button onClick={onClose} aria-label="Hide resources" style={{background:"none",border:"none",color:t.textMuted,cursor:"pointer",fontSize:16,lineHeight:1}}>×</button>
       </div>
       {loading?(
         <div style={{padding:"14px",fontSize:13,color:t.textMuted,fontFamily:"'IM Fell English',Georgia,serif",fontStyle:"italic"}}>
@@ -360,6 +402,48 @@ function ResourceCard({results,loading,t,onClose}){
   );
 }
 
+
+// ── Crisis support notice ─────────────────────────────────────────────────────
+// Shown when someone checks in with a heavy weight on a sensitive topic. This
+// app cannot take an emergency call; a human being can. Kept to one small,
+// dismissible block, with resources for both US and German-speaking readers.
+const CRISIS_TOPICS=["grief","depression","doubt","anxiety","sin"];
+
+const wantsCrisisNotice=checkin=>
+  !!checkin && CRISIS_TOPICS.includes(checkin.topic)
+  && (checkin.weight==="carrying" || checkin.weight==="heavy");
+
+function CrisisNotice({t,language,onDismiss}){
+  const german=/deutsch/i.test(language||"");
+  return(
+    <div role="note" style={{margin:"8px 18px 0",padding:"12px 14px",background:t.dangerBg,border:`1px solid ${t.danger}`,borderRadius:12,animation:"fadeUp 0.3s ease"}}>
+      <div style={{display:"flex",justifyContent:"space-between",gap:10,alignItems:"flex-start"}}>
+        <div style={{fontSize:12,color:t.text,fontFamily:"'IM Fell English',Georgia,serif",lineHeight:1.7}}>
+          {german
+            ? "Wenn es dir gerade sehr schwerfällt, suche bitte einen echten Menschen. Consolatio kann keinen Notruf annehmen."
+            : "If things are very hard right now, please reach a real person. Consolatio cannot take an emergency call."}
+        </div>
+        <button onClick={onDismiss} aria-label="Dismiss"
+          style={{background:"none",border:"none",color:t.danger,cursor:"pointer",fontSize:16,lineHeight:1,flexShrink:0,padding:2}}>×</button>
+      </div>
+      <div style={{marginTop:9,display:"flex",flexDirection:"column",gap:5,fontSize:12,fontFamily:"Lato,sans-serif"}}>
+        <div style={{color:t.textSub}}>
+          {german?"Telefonseelsorge · kostenlos, anonym, 24/7":"Telefonseelsorge · free, anonymous, 24/7"} —{" "}
+          <a href="tel:08001110111" style={{color:t.accent}}>0800 111 0 111</a>
+          {" · "}
+          <a href="tel:08001110222" style={{color:t.accent}}>0800 111 0 222</a>
+        </div>
+        <div style={{color:t.textSub}}>
+          <a href="tel:988" style={{color:t.accent}}>988</a>
+          {" · "}{german?"Suicide & Crisis Lifeline":"Suicide & Crisis Lifeline"}
+        </div>
+        <div style={{color:t.textMuted}}>
+          {german?"Oder Ihre Pastorin, Ihren Pastor oder jemanden, dem Sie vertrauen.":"Or your pastor, or someone you trust."}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function Onboarding({onComplete,t}){
   const [step,setStep]=useState(0);
@@ -451,9 +535,10 @@ function CheckIn({onStart,onSkip,t,profile}){
   const [topic,setTopic]=useState(null);
   const [weight,setWeight]=useState(null);
   const name=profile?.name;
+  useEscape(true,onSkip);
 
   return(
-    <div style={{position:"fixed",inset:0,background:t.overlayBg,zIndex:60,display:"flex",alignItems:"flex-end",animation:"fadeUp 0.2s ease"}} onClick={onSkip}>
+    <div role="dialog" aria-modal="true" aria-label="Session check-in" style={{position:"fixed",inset:0,background:t.overlayBg,zIndex:60,display:"flex",alignItems:"flex-end",animation:"fadeUp 0.2s ease"}} onClick={onSkip}>
       <div style={{width:"100%",maxWidth:480,margin:"0 auto",background:t.sheetBg,borderTop:`1px solid ${t.borderS}`,borderRadius:"22px 22px 0 0",padding:"24px 20px 44px",maxHeight:"90vh",overflowY:"auto"}} onClick={e=>e.stopPropagation()}>
 
         <div style={{fontFamily:"'IM Fell English',Georgia,serif",fontSize:18,color:t.text,marginBottom:4}}>
@@ -510,6 +595,7 @@ function CheckIn({onStart,onSkip,t,profile}){
 // ── Model Sheet ───────────────────────────────────────────────────────────────
 function ModelSheet({current,bookmarks,models,loading:modLoading,onSelect,onToggle,onClose,t}){
   const [search,setSearch]=useState("");
+  useEscape(true,onClose);
   const q=search.toLowerCase().trim();
   const bookmarkedModels=models.filter(m=>bookmarks.includes(m.id));
   const displayed=q?models.filter(m=>m.name.toLowerCase().includes(q)||m.id.toLowerCase().includes(q)||m.provider.toLowerCase().includes(q)):null;
@@ -518,7 +604,7 @@ function ModelSheet({current,bookmarks,models,loading:modLoading,onSelect,onTogg
   const Row=({m})=>(
     <div style={{display:"flex",alignItems:"center",gap:10,padding:"11px 18px",borderBottom:`1px solid ${t.border}`,background:m.id===current?t.accentBg:"transparent",cursor:"pointer",transition:"background 0.15s"}}
       onClick={()=>{onSelect(m.id);onClose();}}>
-      <button style={{background:"none",border:"none",cursor:"pointer",padding:2,flexShrink:0}} onClick={e=>{e.stopPropagation();onToggle(m.id);}}>
+      <button aria-label={bookmarks.includes(m.id)?"Remove from favourites":"Add to favourites"} style={{background:"none",border:"none",cursor:"pointer",padding:2,flexShrink:0}} onClick={e=>{e.stopPropagation();onToggle(m.id);}}>
         <StarIcon filled={bookmarks.includes(m.id)} color={t.accent}/>
       </button>
       <div style={{flex:1,minWidth:0}}>
@@ -530,12 +616,12 @@ function ModelSheet({current,bookmarks,models,loading:modLoading,onSelect,onTogg
   );
 
   return(
-    <div style={{position:"fixed",inset:0,background:t.overlayBg,zIndex:50,display:"flex",alignItems:"flex-end",animation:"fadeUp 0.2s ease"}} onClick={onClose}>
+    <div role="dialog" aria-modal="true" aria-label="Choose a model" style={{position:"fixed",inset:0,background:t.overlayBg,zIndex:50,display:"flex",alignItems:"flex-end",animation:"fadeUp 0.2s ease"}} onClick={onClose}>
       <div style={{width:"100%",maxWidth:480,margin:"0 auto",background:t.sheetBg,borderTop:`1px solid ${t.borderS}`,borderRadius:"22px 22px 0 0",maxHeight:"82vh",display:"flex",flexDirection:"column",overflow:"hidden"}} onClick={e=>e.stopPropagation()}>
         <div style={{padding:"20px 18px 14px",borderBottom:`1px solid ${t.border}`,flexShrink:0}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:13}}>
             <div style={{fontFamily:"'IM Fell English',Georgia,serif",fontSize:17,color:t.text}}>Choose Model</div>
-            <button style={{background:"none",border:"none",color:t.textMuted,cursor:"pointer",fontSize:22,lineHeight:1}} onClick={onClose}>×</button>
+            <button style={{background:"none",border:"none",color:t.textMuted,cursor:"pointer",fontSize:22,lineHeight:1}} onClick={onClose} aria-label="Close model selector">×</button>
           </div>
           <div style={{display:"flex",alignItems:"center",gap:8,background:t.inputBg,border:`1px solid ${t.inputBorder}`,borderRadius:10,padding:"9px 13px"}}>
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={t.textMuted} strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
@@ -567,6 +653,7 @@ function ModelSheet({current,bookmarks,models,loading:modLoading,onSelect,onTogg
 function SettingsPage({onClose,t,isDark,toggleTheme,apiKey,setApiKey,esvKey,setEsvKey,tavilyKey,setTavilyKey,model,setModel,models,profile,setProfile,bookmarks,setBookmarks,onResetOnboarding,onClearSessions}){
   const [tab,setTab]=useState("account");
   const [saved,setSaved]=useState(false);
+  useEscape(true,onClose);
 
   const Section=({title,children})=>(
     <div style={{marginBottom:28}}>
@@ -606,7 +693,7 @@ function SettingsPage({onClose,t,isDark,toggleTheme,apiKey,setApiKey,esvKey,setE
   ];
 
   return(
-    <div style={{position:"fixed",inset:0,background:t.settingsBg,zIndex:80,display:"flex",flexDirection:"column",animation:"slideInRight 0.28s ease"}}>
+    <div role="dialog" aria-modal="true" aria-label="Settings" style={{position:"fixed",inset:0,background:t.settingsBg,zIndex:80,display:"flex",flexDirection:"column",animation:"slideInRight 0.28s ease"}}>
       {/* Header */}
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"14px 18px 12px",borderBottom:`1px solid ${t.border}`,flexShrink:0}}>
         <button onClick={onClose} style={{background:"none",border:"none",cursor:"pointer",color:t.textMuted,display:"flex",alignItems:"center",gap:6,fontFamily:"Lato,sans-serif",fontSize:13,padding:"4px 0"}}>
@@ -756,7 +843,7 @@ function SettingsPage({onClose,t,isDark,toggleTheme,apiKey,setApiKey,esvKey,setE
                 Consolatio is a personal Reformed pastoral companion. It is not a substitute for the local church, the preached Word, the sacraments, or a real pastor. Use it as a supplement — a place to bring what is on your heart between Sundays.
               </div>
               <div style={{marginTop:12,fontSize:11,color:t.textFaint,fontFamily:"Lato,sans-serif",letterSpacing:"0.05em"}}>
-                Version 0.4 · Soli Deo gloria
+                Version {APP_VERSION} · Soli Deo gloria
               </div>
             </Section>
           </>
@@ -770,10 +857,11 @@ function SettingsPage({onClose,t,isDark,toggleTheme,apiKey,setApiKey,esvKey,setE
 
 // ── Sidebar ───────────────────────────────────────────────────────────────────
 function Sidebar({sessions,activeId,onLoad,onNew,onClose,t}){
+  useEscape(true,onClose);
   return(
     <>
       <div style={{position:"fixed",inset:0,background:t.overlayBg,zIndex:20,animation:"fadeUp 0.18s ease"}} onClick={onClose}/>
-      <div style={{position:"fixed",top:0,left:0,bottom:0,width:290,background:t.sidebarBg,borderRight:`1px solid ${t.border}`,zIndex:30,display:"flex",flexDirection:"column",animation:"slideLeft 0.24s ease"}}>
+      <div role="dialog" aria-modal="true" aria-label="Sessions" style={{position:"fixed",top:0,left:0,bottom:0,width:290,background:t.sidebarBg,borderRight:`1px solid ${t.border}`,zIndex:30,display:"flex",flexDirection:"column",animation:"slideLeft 0.24s ease"}}>
         <div style={{padding:"22px 18px 16px",borderBottom:`1px solid ${t.border}`}}>
           <div style={{fontFamily:"'IM Fell English',Georgia,serif",fontSize:19,color:t.text,letterSpacing:"0.03em"}}>Consolatio</div>
           <div style={{fontSize:10,color:t.textMuted,letterSpacing:"0.14em",textTransform:"uppercase",marginTop:2,fontFamily:"Lato,sans-serif"}}>Sessions</div>
@@ -808,6 +896,7 @@ export default function Consolatio(){
   const [input,setInput]           = useState("");
   const [loading,setLoading]       = useState(false);
   const [summarizing,setSummarizing] = useState(false);
+  const [compressError,setCompressError] = useState(null);
   const [model,setModel]           = useState(()=>LS.raw("consolatio_model",DEFAULT_MODEL));
   const [bookmarks,setBookmarks]   = useState(()=>LS.get("consolatio_bookmarks",[]));
   const [apiKey,setApiKey]         = useState(()=>LS.raw("consolatio_key",""));
@@ -822,6 +911,7 @@ export default function Consolatio(){
   const [showSettings,setShowSettings] = useState(false);
   const [showCheckin,setShowCheckin]   = useState(false);
   const [checkinData,setCheckinData]   = useState(null);
+  const [crisisDismissed,setCrisisDismissed] = useState(false);
   const [resources,setResources]       = useState([]);
   const [resourcesLoading,setResourcesLoading] = useState(false);
   const [showResources,setShowResources] = useState(false);
@@ -867,6 +957,11 @@ export default function Consolatio(){
   const resetOnboarding=()=>{ LS.set("consolatio_onboarded",false); setOnboarded(false); setShowSettings(false); };
   const clearSessions=()=>{ setSessions([]); setMessages([]); setActiveId(null); LS.set("consolatio_sessions",[]); };
 
+const dismissCrisis=()=>{
+  setCrisisDismissed(true);
+  if(activeId) setSessions(p=>p.map(s=>s.id===activeId?{...s,crisisDismissed:true}:s));
+};
+
   const startNew=()=>{
     setShowSidebar(false);
     setShowCheckin(true);
@@ -875,6 +970,8 @@ export default function Consolatio(){
   const beginSession=(checkin)=>{
     setCheckinData(checkin);
     setShowCheckin(false);
+    setCrisisDismissed(false);
+    setCompressError(null);
     const s={ id:Date.now().toString(), createdAt:new Date().toISOString(), title:"New session", messages:[], checkin };
     setSessions(p=>[s,...p]);
     setActiveId(s.id);
@@ -884,7 +981,7 @@ export default function Consolatio(){
 
   const loadSession=id=>{
     const s=sessions.find(x=>x.id===id);
-    if(s){ setActiveId(id); setMessages(s.messages); setCheckinData(s.checkin||null); }
+    if(s){ setActiveId(id); setMessages(s.messages); setCheckinData(s.checkin||null); setCrisisDismissed(!!s.crisisDismissed); setCompressError(null); }
   };
 
   const updateSession=(id,msgs)=>{
@@ -921,7 +1018,8 @@ export default function Consolatio(){
   };
 
   const summarizeSession=async()=>{
-    if(messages.length<4||!apiKey) return;
+    if(messages.length<4||!apiKey||summarizing) return;
+    if(!window.confirm(`Compress replaces this transcript with a summary.\n\nAll ${messages.length} messages will be removed from view. This cannot be undone.`)) return;
     setSummarizing(true);
     try{
       const res=await fetch("https://openrouter.ai/api/v1/chat/completions",{
@@ -936,17 +1034,20 @@ export default function Consolatio(){
           max_tokens:600,temperature:0.4,
         }),
       });
-      const data=await res.json();
-      const summary=data.choices?.[0]?.message?.content||"Could not generate summary.";
-      const summaryMsg={role:"assistant",content:`\u2014 Session Summary \u2014\n\n${summary}`,timestamp:new Date().toISOString(),isSummary:true};
+      const data=await res.json().catch(()=>null);
+      if(!res.ok) throw new Error(openRouterError(res.status,data));
+      const summary=data?.choices?.[0]?.message?.content;
+      if(!summary) throw new Error("Could not generate a summary.");
       // Replace full history with a condensed version
       const condensed=[
         {role:"assistant",content:`[Session compressed. Original: ${messages.length} messages.]\n\n${summary}`,timestamp:new Date().toISOString(),isSummary:true},
       ];
       setMessages(condensed);
       updateSession(activeId,condensed);
+      setCompressError(null);
     }catch(e){
       console.error(e);
+      setCompressError(e.message||"Could not compress this session.");
     }finally{
       setSummarizing(false);
     }
@@ -986,8 +1087,10 @@ export default function Consolatio(){
           max_tokens:1024,temperature:0.72,
         }),
       });
-      const data=await res.json();
-      const text=data.choices?.[0]?.message?.content||"I am here. Please try again.";
+      const data=await res.json().catch(()=>null);
+      if(!res.ok) throw new Error(openRouterError(res.status,data));
+      const text=data?.choices?.[0]?.message?.content;
+      if(!text) throw new Error("The model returned an empty reply. Please try again.");
       const am={role:"assistant",content:text,timestamp:new Date().toISOString()};
       const fin=[...next,am];
       setMessages(fin); updateSession(sid,fin);
@@ -995,8 +1098,8 @@ export default function Consolatio(){
       if(fin.filter(m=>m.role==="assistant").length===1&&tavilyKey&&checkinData?.topic){
         fetchResources(checkinData.topic);
       }
-    }catch{
-      const em={role:"assistant",content:"Something went quiet. Please check your connection and try again.",timestamp:new Date().toISOString()};
+    }catch(e){
+      const em={role:"assistant",content:e.message||"Something went quiet. Please check your connection and try again.",timestamp:new Date().toISOString()};
       const fin=[...next,em];
       setMessages(fin); updateSession(sid,fin);
     }finally{
@@ -1021,7 +1124,6 @@ export default function Consolatio(){
   return(
     <>
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=IM+Fell+English:ital@0;1&family=Lato:wght@300;400&display=swap');
         *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
         body{background:${t.bg};overflow:hidden;transition:background 0.3s;}
         ::-webkit-scrollbar{width:4px;}
@@ -1063,7 +1165,7 @@ export default function Consolatio(){
       <div className="app">
         {/* Topbar */}
         <div className="topbar">
-          <button className="ibtn" onClick={()=>setShowSidebar(true)}>
+          <button className="ibtn" aria-label="Open sessions" onClick={()=>setShowSidebar(true)}>
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
               <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
             </svg>
@@ -1073,15 +1175,15 @@ export default function Consolatio(){
             <div className="topbar-sub">Reformed Pastoral Companion</div>
           </div>
           <div style={{display:"flex",alignItems:"center",gap:4}}>
-            <button className="theme-toggle" onClick={toggleTheme}>
+            <button className="theme-toggle" aria-label={isDark?"Switch to light theme":"Switch to dark theme"} aria-pressed={isDark} onClick={toggleTheme}>
               <div className="theme-toggle-knob">{isDark?<MoonIcon/>:<SunIcon/>}</div>
             </button>
-            <button className="ibtn" onClick={()=>setShowScripture(v=>!v)}>
+            <button className="ibtn" aria-label="Show a passage" aria-pressed={showScripture} onClick={()=>setShowScripture(v=>!v)}>
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
                 <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
               </svg>
             </button>
-            <button className="ibtn" onClick={()=>setShowSettings(true)}>
+            <button className="ibtn" aria-label="Open settings" onClick={()=>setShowSettings(true)}>
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
                 <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
               </svg>
@@ -1091,7 +1193,7 @@ export default function Consolatio(){
 
         {/* Model pill + token warning */}
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 16px 2px"}}>
-          <button className="model-pill" onClick={()=>setShowModels(true)}>
+          <button className="model-pill" onClick={()=>setShowModels(true)} aria-label={`Change model. Current model: ${currentLabel}`}>
             <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke={t.textMuted} strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/></svg>
             <span className="model-pill-label">{currentLabel}</span>
             <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke={t.textMuted} strokeWidth="2.5" strokeLinecap="round"><polyline points="6 9 12 15 18 9"/></svg>
@@ -1100,6 +1202,7 @@ export default function Consolatio(){
             <div style={{display:"flex",alignItems:"center",gap:8}}>
               {tokenWarning&&(
                 <button onClick={summarizeSession} disabled={summarizing||!apiKey}
+                  title="Replace this transcript with a summary"
                   style={{fontSize:10,color:t.accent,background:t.accentBg,border:`1px solid ${t.accentBorder}`,borderRadius:8,padding:"4px 9px",cursor:"pointer",fontFamily:"Lato,sans-serif",letterSpacing:"0.04em",opacity:summarizing?0.5:1}}>
                   {summarizing?"Compressing…":"⚡ Compress"}
                 </button>
@@ -1131,6 +1234,11 @@ export default function Consolatio(){
               </div>
             )}
           </div>
+        )}
+
+        {/* Crisis support — shown for heavy check-ins on sensitive topics */}
+        {!crisisDismissed&&wantsCrisisNotice(checkinData)&&(
+          <CrisisNotice t={t} language={profile?.language} onDismiss={dismissCrisis}/>
         )}
 
         {/* Resource card */}
@@ -1169,6 +1277,12 @@ export default function Consolatio(){
             </div>
           ):(
             <>
+              {compressError&&(
+                <div role="alert" style={{margin:"0 0 14px",padding:"10px 13px",background:t.dangerBg,border:`1px solid ${t.danger}`,borderRadius:10,fontSize:12,color:t.danger,fontFamily:"Lato,sans-serif",lineHeight:1.55,display:"flex",justifyContent:"space-between",gap:10,alignItems:"center"}}>
+                  <span>{compressError}</span>
+                  <button onClick={()=>setCompressError(null)} aria-label="Dismiss" style={{background:"none",border:"none",color:"inherit",cursor:"pointer",fontSize:16,lineHeight:1,flexShrink:0}}>×</button>
+                </div>
+              )}
               {messages.map((m,i)=><Message key={i} msg={m} t={t} esvKey={esvKey}/>)}
               {loading&&(
                 <div style={{paddingLeft:4,marginBottom:16,animation:"fadeUp 0.25s ease"}}>
@@ -1184,8 +1298,8 @@ export default function Consolatio(){
         {/* Input */}
         <div className="input-area">
           <div className="input-row">
-            <textarea ref={taRef} rows={1} placeholder="What is on your heart\u2026" value={input} onChange={onInput} onKeyDown={onKey}/>
-            <button className="send-btn" onClick={send} disabled={!input.trim()||loading}><SendIcon/></button>
+            <textarea ref={taRef} rows={1} placeholder="What is on your heart\u2026" value={input} onChange={onInput} onKeyDown={onKey} aria-label="Write a message"/>
+            <button className="send-btn" onClick={send} disabled={!input.trim()||loading} aria-label="Send"><SendIcon/></button>
           </div>
         </div>
       </div>
